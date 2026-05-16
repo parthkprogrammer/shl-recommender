@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Optional
 
 from groq import Groq
-import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -61,64 +60,27 @@ def build_doc_text(item: dict) -> str:
     return " | ".join(parts)
 
 
-# ── Vector store with graceful fallback ───────────────────────────────────────
+# ── Vector store (TF-IDF only — lightweight for free hosting) ─────────────────
 class VectorStore:
     def __init__(self, catalog: list[dict]):
         self.catalog = catalog
         self.docs = [build_doc_text(item) for item in catalog]
-        self._use_semantic = False
-        self._try_load_semantic()
-        if not self._use_semantic:
-            self._build_tfidf()
-
-    def _try_load_semantic(self):
-        try:
-            from sentence_transformers import SentenceTransformer
-            import faiss
-            model = SentenceTransformer("all-MiniLM-L6-v2")
-            embeddings = model.encode(self.docs, show_progress_bar=False)
-            embeddings = np.array(embeddings, dtype="float32")
-            faiss.normalize_L2(embeddings)
-            index = faiss.IndexFlatIP(embeddings.shape[1])
-            index.add(embeddings)
-            self._model = model
-            self._index = index
-            self._use_semantic = True
-            print("[VectorStore] Semantic search enabled")
-        except Exception as e:
-            print(f"[VectorStore] Falling back to TF-IDF: {e}")
-
-    def _build_tfidf(self):
         from sklearn.feature_extraction.text import TfidfVectorizer
         self._tfidf = TfidfVectorizer(ngram_range=(1, 2), max_features=8000)
-        self._tfidf_matrix = self._tfidf.fit_transform(self.docs)
-        print("[VectorStore] TF-IDF search enabled")
+        self._matrix = self._tfidf.fit_transform(self.docs)
+        print("[VectorStore] TF-IDF search ready")
 
     def search(self, query: str, k: int = 20) -> list[dict]:
-        if self._use_semantic:
-            import faiss
-            q_emb = self._model.encode([query])
-            q_emb = np.array(q_emb, dtype="float32")
-            faiss.normalize_L2(q_emb)
-            scores, indices = self._index.search(q_emb, k)
-            results = []
-            for score, idx in zip(scores[0], indices[0]):
-                if idx >= 0:
-                    item = self.catalog[idx].copy()
-                    item["_score"] = float(score)
-                    results.append(item)
-            return results
-        else:
-            from sklearn.metrics.pairwise import cosine_similarity
-            q_vec = self._tfidf.transform([query])
-            scores = cosine_similarity(q_vec, self._tfidf_matrix).flatten()
-            top_indices = scores.argsort()[::-1][:k]
-            results = []
-            for idx in top_indices:
-                item = self.catalog[idx].copy()
-                item["_score"] = float(scores[idx])
-                results.append(item)
-            return results
+        from sklearn.metrics.pairwise import cosine_similarity
+        q_vec = self._tfidf.transform([query])
+        scores = cosine_similarity(q_vec, self._matrix).flatten()
+        top_indices = scores.argsort()[::-1][:k]
+        results = []
+        for idx in top_indices:
+            item = self.catalog[idx].copy()
+            item["_score"] = float(scores[idx])
+            results.append(item)
+        return results
 
 
 # ── Global state ───────────────────────────────────────────────────────────────
