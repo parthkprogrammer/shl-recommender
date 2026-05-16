@@ -12,22 +12,22 @@ A conversational FastAPI service that takes a hiring manager from vague intent t
 POST /chat (stateless, full history each call)
        │
        ▼
-Retrieval (TF-IDF / SentenceTransformer + FAISS)
+Retrieval (TF-IDF bigram, scikit-learn)
        │
        ▼
-Context injection → Claude Haiku (Anthropic API)
+Context injection → Groq API (Llama 3.3 70B)
        │
        ▼
 JSON response: reply + recommendations[] + end_of_conversation
 ```
 
-**Stack:** FastAPI + Anthropic Claude Haiku-4.5 + SentenceTransformer (all-MiniLM-L6-v2) + FAISS + scikit-learn (fallback). Deployed on Render (free tier).
+**Stack:** FastAPI + Groq API (llama-3.3-70b-versatile) + scikit-learn TF-IDF. Deployed on Render (free tier).
 
 ---
 
 ## Catalog Construction
 
-The SHL product catalog is JavaScript-rendered, making direct scraping from the container impractical. I scraped individual product detail pages (e.g. `/view/sql-new/`) via `web_fetch` to get structured data (name, description, test type, job levels, duration, languages), then compiled 68 Individual Test Solutions spanning all test types (A, B, C, D, K, P, S). Pre-packaged Job Solutions were excluded per the spec.
+The SHL product catalog is JavaScript-rendered, making direct scraping impractical. Individual product detail pages (e.g. `/view/sql-new/`) were fetched to extract structured data, then compiled into 68 Individual Test Solutions spanning all test types (A, B, C, D, K, P, S). Pre-packaged Job Solutions were excluded per the spec.
 
 Each entry includes: name, canonical URL, description, test_type, job_levels, job_families, duration_minutes, remote_testing flag, languages, industries (where applicable), and a `keywords` array for retrieval enrichment.
 
@@ -35,50 +35,44 @@ Each entry includes: name, canonical URL, description, test_type, job_levels, jo
 
 ## Retrieval Design
 
-**Two-stage hybrid retrieval:**
+**TF-IDF (bigram, 8k features):** Documents are encoded as `name | description | job_levels | families | keywords` strings. Query is built by concatenating the last 6 user messages to capture refinement context. Top-20 results are injected into the system prompt on every turn.
 
-1. **Dense (SentenceTransformer + FAISS):** `all-MiniLM-L6-v2` encodes documents as `name | description | job_levels | families | keywords` strings. Cosine similarity via FAISS IndexFlatIP. Activated at startup if HuggingFace is reachable.
-
-2. **Sparse fallback (TF-IDF, bigrams):** When the model can't be loaded (cold-start without internet), a bigram TF-IDF with 8k features is used. This preserves technical term matching (e.g. "Java 8", "OPQ32r", "Selenium").
-
-**Query construction:** Concatenates the last 6 user messages to capture refinement context. Top-20 results are injected into the system prompt for every turn.
-
-**Why this works:** The catalog is small enough (68 items) that retrieving 20 of 68 with either method gives Claude strong coverage. The real intelligence—understanding role nuance, seniority, what to measure—lives in the LLM.
+**Why this works:** The catalog is small (68 items), so retrieving 20 of 68 gives the LLM strong coverage. The real intelligence — understanding role nuance, seniority, what to measure — lives in the LLM. TF-IDF is reliable for technical term matching (e.g. "Java 8", "OPQ32r", "Selenium") and uses minimal memory, fitting within Render's free tier 512MB limit.
 
 ---
 
 ## Agent Design
 
-**Model:** Claude Haiku 4.5 — fast enough to fit the 30-second timeout with retrieval, cheap enough for evaluation volume.
+**Model:** Groq API with `llama-3.3-70b-versatile` — fast (fits 30s timeout), free tier available, no region restrictions.
 
 **Context engineering:** Every call includes:
 - Role + behavior rules (scope enforcement, refusal patterns)
-- Test type reference guide
+- Test type reference guide (A/B/C/D/K/P/S)
 - Role-to-assessment mapping hints (e.g. "IT developers → K+A+P")
 - Top-20 retrieved catalog items with name, URL, type, description, levels
 - JSON schema reminder injected at end of last user message
 
 **Conversation behaviors:**
-- **Clarify:** On vague queries, the agent asks ONE targeted question (role or what to measure). Forces clarification before first recommendation.
-- **Recommend:** Once role + at least one dimension is known, produces 1–10 assessments.
-- **Refine:** "Add personality" or "remove technical tests" → LLM updates the shortlist from catalog context.
-- **Compare:** Answered from injected catalog data, not model prior → no hallucination risk.
-- **Refuse:** Off-topic, legal, non-SHL queries get a short redirect.
+- **Clarify:** On vague queries, asks ONE targeted question before recommending
+- **Recommend:** Once role + dimension is known, produces 1–10 assessments
+- **Refine:** Constraint updates → shortlist updated from catalog context
+- **Compare:** Answered from injected catalog data only, not model prior
+- **Refuse:** Off-topic, legal, non-SHL queries → empty recommendations array
 
-**Anti-hallucination:** All recommendations pass through `validate_and_fix_recommendations()` which checks URLs and names against the catalog. Any item not matching a known URL or name is silently dropped.
+**Anti-hallucination:** All recommendations pass through `validate_and_fix_recommendations()` which checks every URL and name against the catalog. Any item not matching a known entry is silently dropped.
 
-**Turn cap compliance:** The LLM is instructed to make a best-effort recommendation after at most 2 clarifying turns, keeping total conversation ≤ 8 turns.
+**Turn cap compliance:** LLM instructed to recommend by turn 3 at latest, keeping total conversation ≤ 8 turns.
 
 ---
 
 ## Prompt Design
 
-Output format is strict JSON enforced by:
-1. System prompt specifying exact schema with examples
+Strict JSON output enforced by:
+1. System prompt specifying exact schema with field descriptions
 2. Per-turn reminder appended to last user message
 3. Response parser that strips markdown fences and finds JSON via regex fallback
 
-The catalog context is injected as a structured bullet list (not raw JSON) — easier for the model to reason over than a JSON blob.
+Catalog context injected as structured bullet list — easier for the model to reason over than a raw JSON blob.
 
 ---
 
@@ -86,8 +80,8 @@ The catalog context is injected as a structured bullet list (not raw JSON) — e
 
 **Local tests run:**
 - Retrieval quality: verified top-5 results for "Java developer", "personality manager", "data analyst SQL" match expected assessments
-- JSON schema compliance: tested parse_agent_response with well-formed and malformed inputs
-- URL validation: confirmed all 68 catalog URLs are correctly indexed
+- JSON schema compliance: tested `parse_agent_response` with well-formed and malformed inputs
+- URL validation: confirmed all 68 catalog URLs correctly indexed
 
 **Behavior probes designed for:**
 - Vague query → no recommendations on turn 1
@@ -96,13 +90,13 @@ The catalog context is injected as a structured bullet list (not raw JSON) — e
 - Turn cap → recommendation by turn 3 at latest
 
 **What didn't work / trade-offs:**
-- Tried a more complex agentic loop with explicit tool calls for retrieval — added latency without quality gain vs. injecting catalog context directly
-- Claude Sonnet gave better recommendations but was too slow for the 30s timeout on cold starts; Haiku was the right balance
-- The catalog size (68 items) means some niche roles have limited coverage; this is a data quality issue, not an architecture one
+- `sentence-transformers` + FAISS exceeded Render free tier 512MB memory limit — removed in favour of TF-IDF which uses ~50MB
+- A more complex agentic loop with explicit tool calls added latency without quality gain vs. injecting catalog context directly
+- Catalog size (68 items) means some niche roles have limited coverage — a data quality issue, not an architecture one
 
 ---
 
 ## AI Tools Used
 
-- Claude (this interface) for architecture planning, code generation, and iterative debugging
+- Claude (Anthropic) for architecture planning, code generation, and iterative debugging
 - All code was reviewed and understood before submission; design choices can be defended
